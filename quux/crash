@@ -1,0 +1,13 @@
+while (args)
+        {
+            element = eval_(env, args);
+            if (element->type == MAL_ERROR)
+            {
+                freenode(evallist);
+                return element;
+            }
+
+            *dst = element;
+            dst = &element->next;
+            args = args->next;
+        }
