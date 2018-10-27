@@ -1,0 +1,5 @@
+#!/bin/bash
+
+STEP=${STEP:-stepA_mal}
+
+exec "$(dirname $0)/$STEP" "${@}"
