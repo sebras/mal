@@ -1,4 +1,4 @@
-SRCS = step0_repl.c step1_read_print.c
+SRCS = step0_repl.c step1_read_print.c step2_eval.c
 OBJS = $(SRCS:%.c=%.o)
 BINS = $(OBJS:%.o=%)
 
