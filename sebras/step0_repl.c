@@ -1,144 +1,63 @@
+#define _GNU_SOURCE
+
+#include <readline/readline.h>
+#include <readline/history.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
+#include <stdbool.h>
 
-static const char *seb_read(const char *s)
+#define PROMPT "user> "
+
+static bool print(char *ast, bool readable)
 {
-	return s;
+        if (!ast)
+        {
+                printf("\n");
+                return false;
+        }
+
+        if (strlen(ast))
+                printf("%s\n", ast);
+        free(ast);
+
+        return true;
 }
 
-static const char *seb_eval(const char *s)
+static char *eval(char *ast)
 {
-	return s;
+	return ast;
 }
 
-static const char *seb_print(const char *s)
+static char *parse(char *line)
 {
-	return s;
+        char *ast;
+
+        if (!line)
+                return NULL;
+
+        ast = strdup(line);
+        free(line);
+
+        return ast;
 }
 
-static char *seb_rep(const char *s)
+static char *reed(char *prompt)
 {
-	s = seb_read(s);
-	s = seb_eval(s);
-	seb_print(s);
+        char *line = readline(prompt);
+        if (line && *line)
+                add_history(line);
+        return line;
 }
 
-static char *prompt(const char *prompt)
+static void repl(void)
 {
-	char *prevline = NULL;
-	char *line = NULL;
-	size_t cap = 0;
-	size_t len = 0;
-	int c;
-
-	printf("%s ", prompt);
-
-	c = fgetc(stdin);
-	if (c == EOF)
-		return NULL;
-
-	while (c != EOF)
-	{
-		if (len + 1 > cap)
-		{
-			cap = cap > 0 ? 2 * cap : 1;
-			line = realloc(prevline = line, cap);
-			if (line == NULL && cap != 0)
-			{
-				free(prevline);
-				return "Failed to allocate input line buffer";
-			}
-		}
-
-		if (c == '\n' || c == '\r' || c == '\0')
-		{
-			line[len++] = '\0';
-			c = EOF;
-		}
-		else
-		{
-			line[len++] = c;
-			c = fgetc(stdin);
-		}
-
-	}
-
-	return line;
+        while (print(eval(parse(reed(PROMPT))), true));
 }
 
 int main(int argc, char **argv)
 {
-	char *line;
-	char *result;
+        repl();
 
-	do
-	{
-		line = prompt("user>");
-		if (line == NULL)
-			result = strdup("");
-		else
-			result = seb_rep(line);
-		printf("%s\n", result);
-		free(result);
-	} while (line != NULL);
+        return 0;
 }
-
-#if 0
-int main(int argc, char **argv)
-{
-	char *prevline, *line, *result;
-	size_t cap, len;
-	int c;
-
-	do
-	{
-		result = NULL;
-		line = NULL;
-		cap = 0;
-		len = 0;
-
-		printf("user> ");
-
-		c = fgetc(stdin);
-		while (c != EOF)
-		{
-			if (len + 1 > cap)
-			{
-				cap = cap > 0 ? 2 * cap : 1;
-				line = realloc(prevline = line, cap);
-				if (!line && cap)
-				{
-					free(prevline);
-					result = strdup("cannot allocate input line buffer");
-					c = EOF;
-					continue;
-				}
-			}
-
-			if (c == '\n' || c == '\r' || c == '\0')
-			{
-				line[len++] = '\0';
-				c = EOF;
-				continue;
-			}
-
-			line[len++] = c;
-			c = fgetc(stdin);
-		}
-
-		if (line && !result)
-			result = rep(line);
-
-		if (result && strlen(result))
-			printf("%s\n", result);
-
-		free(result);
-		result = NULL;
-
-	} while (line != NULL);
-
-	printf("\n");
-}
-#endif

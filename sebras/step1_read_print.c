@@ -7,418 +7,345 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <stdbool.h>
 
-static char *ensure(char *p, size_t s)
-{
-	return realloc(p, strlen(p) + 1 + s);
-}
+#define PROMPT "user> "
 
-struct token
+enum nodetype
 {
-	struct token *next;
-	char *s;
+        ERROR = -1,
+        FALSE = 0,
+        TRUE = 1,
+        NIL,
+        INTEGER,
+        REAL,
+        SYMBOL,
+        STRING,
+        LIST,
+        VECTOR,
+        KEYWORD,
+        HASHMAP,
 };
-
-static struct token formaterrortoken3 = { NULL, ")" };
-static struct token formaterrortoken2 = { &formaterrortoken3, NULL };
-static struct token formaterrortoken1 = { &formaterrortoken2, "error" };
-static struct token formaterrortoken0 = { &formaterrortoken1, "(" };
-
-static void free_tokens(struct token *tokens)
-{
-	struct token *next;
-
-	if (tokens == &formaterrortoken0)
-		return;
-
-	while (tokens)
-	{
-		next = tokens->next;
-		free(tokens->s);
-		free(tokens);
-		tokens = next;
-	}
-}
-
-#define new_error_token(msg) new_error_token_imp("\"" msg "\"")
-
-static struct token *new_error_token_imp(char *msg)
-{
-	formaterrortoken2.s = msg;
-	return &formaterrortoken0;
-}
-
-static struct token *append_token(struct token *tokens, struct token ***tail, char *s, char *e)
-{
-	struct token *token;
-
-	token = malloc(sizeof(struct token));
-	if (!token)
-	{
-		**tail = NULL;
-		free_tokens(tokens);
-		return new_error_token("cannot allocate token");
-	}
-
-	token->s = strndup(s, e - s);
-	token->next = NULL;
-
-	if (!token->s)
-	{
-		**tail = NULL;
-		free_tokens(token);
-		free_tokens(tokens);
-		return new_error_token("cannot format token");
-	}
-
-	**tail = token;
-	*tail = &token->next;
-
-	return NULL;
-}
-
-#define WHITESPACE "\t\n\v\f\r "
-#define COMMA ","
-#define SPLICEUNQOTE "~@"
-#define SPECIAL "[]{}()'`~^@"
-#define QUOTE '"'
-#define ESCAPEDQUOTE "\\\""
-#define SEMICOLON ';'
-#define NONSYMBOLCHARS WHITESPACE "[]{}()'\"`,;"
-
-static struct token *tokenize(char *code)
-{
-	struct token *tokens = NULL;
-	struct token **tail = &tokens;
-	char *e = code + strlen(code);
-	char *p = code;
-
-	while (p < e)
-	{
-		struct token *err = NULL;
-
-		while (p < e && strchr(WHITESPACE COMMA, *p))
-			p++;
-
-		if (e - p >= 2 && !strcmp(SPLICEUNQOTE, p))
-		{
-			err = append_token(tokens, &tail, p, p + 2);
-			p += 2;
-		}
-		else if (e - p >= 1 && strchr(SPECIAL, *p))
-		{
-			err = append_token(tokens, &tail, p, p + 1);
-			p++;
-		}
-		else if (e - p >= 1 && *p == QUOTE)
-		{
-			char *start = p++;
-			char *s;
-
-			while (p < e && *p != QUOTE)
-			{
-				if (!strncmp(p, ESCAPEDQUOTE, 2))
-					p += 2;
-				else if (*p != QUOTE)
-					p++;
-			}
-
-			if (p == e)
-			{
-				free_tokens(tokens);
-				return new_error_token("unterminated string encountered");
-			}
-
-			if (p < e && *p != QUOTE)
-			{
-				free_tokens(tokens);
-				return new_error_token("string not terminated by quote");
-			}
-
-			p++;
-
-			start = s = strndup(start, p - start);
-
-			while (*s)
-			{
-				if (*s == '\\')
-				{
-					if (strlen(s) <= 1)
-					{
-						free_tokens(tokens);
-						return new_error_token("unterminated string escape sequence");
-					}
-
-					switch (s[1])
-					{
-					case 'a': *s = '\a'; break;
-					case 'b': *s = '\b'; break;
-					case 'e': *s = '\x1b'; break;
-					case 'f': *s = '\f'; break;
-					case 'n': *s = '\n'; break;
-					case 'r': *s = '\r'; break;
-					case 't': *s = '\t'; break;
-					case 'v': *s = '\v'; break;
-					case '\\': *s = '\\'; break;
-					case '"': *s = '"'; break;
-					default:
-						free_tokens(tokens);
-						return new_error_token("invalid string escape sequence");
-					}
-					memmove(&s[1], &s[2], strlen(s));
-				}
-
-				s++;
-			}
-
-			err = append_token(tokens, &tail, start, s);
-
-			free(start);
-		}
-		else if (e - p >= 1 && *p == SEMICOLON)
-			p = e;
-		else if (e - p >= 1)
-		{
-			char *start = p++;
-
-			while (p < e && !strchr(NONSYMBOLCHARS, *p))
-				p++;
-			err = append_token(tokens, &tail, start, p);
-		}
-
-		if (err)
-			return err;
-	}
-
-	return tokens;
-}
 
 struct node
 {
-	enum
-	{
-		ERROR = -1,
-		FALSE = 0,
-		TRUE = 1,
-		NIL,
-		INTEGER,
-		REAL,
-		SYMBOL,
-		STRING,
-		LIST,
-		VECTOR,
-		KEYWORD,
-	} type;
-	struct node *down, *next;
+        enum nodetype type;
+	struct node *next;
 	union {
-		char *error;
+		char *message;
 		long long integer;
 		double real;
 		char *string;
 		char *symbol;
 		char *keyword;
+                struct node *list;
+                struct node *vector;
+                struct {
+                        struct node *keys;
+                        struct node *values;
+                } hashmap;
 	} u;
 };
 
-struct node parseerror;
-
-static struct node *new_error(char *msg)
+static struct node staticerror =
 {
-	parseerror.type = ERROR;
-	parseerror.u.error = msg;
-	return &parseerror;
+        ERROR,
+        NULL,
+};
+
+static char *errortokens[] =
+{
+        "(",
+        "error",
+        "\"unknown error\"",
+        ")",
+        NULL
+};
+
+static char *typestring(enum nodetype type)
+{
+        switch (type)
+        {
+        case ERROR: return "error";
+        case FALSE: return "false";
+        case TRUE: return "true";
+        case NIL: return "nil";
+        case INTEGER: return "integer";
+        case REAL: return "real";
+        case SYMBOL: return "symbol";
+        case STRING: return "string";
+        case LIST: return "list";
+        case VECTOR: return "vector";
+        case KEYWORD: return "keyword";
+        case HASHMAP: return "hashmap";
+        }
 }
 
-static void free_node(struct node *node)
+static bool freenode(struct node *node)
 {
-	struct node *next;
+        struct node *orig = node;
+        struct node *tmp;
 
-	if (node == &parseerror)
-		return;
+        while (node)
+        {
+                tmp = node->next;
 
-	while (node)
-	{
-		next = node->next;
+                if (node->type == ERROR && node != &staticerror)
+                        free(node->u.message);
+                else if (node->type == STRING)
+                        free(node->u.string);
+                else if (node->type == SYMBOL)
+                        free(node->u.symbol);
+                else if (node->type == KEYWORD)
+                        free(node->u.keyword);
+                else if (node->type == LIST)
+                        freenode(node->u.list);
+                else if (node->type == VECTOR)
+                        freenode(node->u.vector);
 
-		switch (node->type)
-		{
-		case VECTOR:
-		case LIST:
-			free_node(node->down);
-			break;
-		case SYMBOL:
-			free(node->u.symbol);
-			break;
-		case STRING:
-			free(node->u.string);
-			break;
-		case KEYWORD:
-			free(node->u.keyword);
-			break;
-		}
-		free(node);
+                if (node != &staticerror)
+                        free(node);
+                node = tmp;
+        }
 
-		node = next;
-	}
+        return orig != NULL;
 }
 
-static struct node *new_node(int type)
+static void print_string_readably(char *s)
 {
-	struct node *node = malloc(sizeof(struct node));
+        printf("\"");
+        while (*s)
+        {
+                switch (*s)
+                {
+                case '\a': printf("\\a"); break;
+                case '\b': printf("\\b"); break;
+                case '\x1b': printf("\\e"); break;
+                case '\f': printf("\\f"); break;
+                case '\n': printf("\\n"); break;
+                case '\r': printf("\\r"); break;
+                case '\t': printf("\\t"); break;
+                case '\v': printf("\\v"); break;
+                case '\\': printf("\\\\"); break;
+                case '"': printf("\\\""); break;
+                default: printf("%c", *s); break;
+                }
+                s++;
+        }
+        printf("\"");
+}
+
+static void print_imp(struct node *node, bool readably)
+{
+        switch(node->type)
+        {
+        case ERROR: printf("Error: %s\n", node->u.message); break;
+        case NIL: printf("nil"); break;
+        case TRUE: printf("true"); break;
+        case FALSE: printf("false"); break;
+        case INTEGER: printf("%lld", node->u.integer); break;
+        case REAL: printf("%f", node->u.real); break;
+        case KEYWORD: printf(":%s", node->u.keyword); break;
+        case SYMBOL: printf("%s", node->u.symbol); break;
+        case STRING:
+                if (readably)
+                        print_string_readably(node->u.string);
+                else
+                        printf("%s", node->u.string);
+                break;
+        case LIST:
+                {
+                        struct node *list = node->u.list;
+
+                        printf("(");
+                        while (list)
+                        {
+                                print_imp(list, readably);
+                                list = list->next;
+                                if (list)
+                                        printf(" ");
+                        }
+                        printf(")");
+                }
+                break;
+        case VECTOR:
+                {
+                        struct node *vector = node->u.vector;
+
+                        printf("[");
+                        while (vector)
+                        {
+                                print_imp(vector, readably);
+                                vector = vector->next;
+                                if (vector)
+                                        printf(" ");
+                        }
+                        printf("]");
+                }
+                break;
+        case HASHMAP:
+                {
+                        struct node *key = node->u.hashmap.keys;
+                        struct node *val = node->u.hashmap.values;
+
+                        printf("{");
+                        while (key && val)
+                        {
+                                print_imp(key, readably);
+                                printf(" ");
+                                print_imp(val, readably);
+                                key = key->next;
+                                val = val->next;
+                                if (key)
+                                        printf(" ");
+                        }
+                        printf("}");
+                }
+                break;
+        }
+}
+
+static bool print(struct node *node, bool readably)
+{
+        if (node)
+        {
+                print_imp(node, readably);
+                freenode(node);
+        }
+        printf("\n");
+        return node != NULL;
+}
+
+static struct node *eval(struct node *ast)
+{
+	return ast;
+}
+
+static struct node *new_staticerror(char *msg)
+{
+	staticerror.type = ERROR;
+        staticerror.next = NULL;
+	staticerror.u.message = msg;
+	return &staticerror;
+}
+
+static struct node *new_node(int type, long long integer, double real, char *string, struct node *keys, struct node *values)
+{
+	struct node *node;
+
+        if (type == ERROR && !string)
+                return new_staticerror("cannot format error message");
+        else if (type == STRING && !string)
+                return new_staticerror("cannot allocate node string");
+        else if (type == KEYWORD && !string)
+                return new_staticerror("cannot allocate node keyword");
+        else if (type == SYMBOL && !string)
+                return new_staticerror("cannot allocate node symbol");
+
+	node = calloc(1, sizeof(struct node));
 	if (!node)
-		return new_error("error allocating node");
-	node->next = NULL;
-	node->down = NULL;
+		return new_staticerror("error allocating node");
+
 	node->type = type;
+        if (type == INTEGER)
+                node->u.integer = integer;
+        else if (type == REAL)
+                node->u.real = real;
+        else if (type == STRING)
+                node->u.string = string;
+        else if (type == KEYWORD)
+                node->u.keyword = string;
+        else if (type == SYMBOL)
+                node->u.symbol = string;
+        else if (type == LIST)
+                node->u.list = values;
+        else if (type == VECTOR)
+                node->u.vector = values;
+        else if (type == HASHMAP)
+        {
+                node->u.hashmap.keys = keys;
+                node->u.hashmap.values = values;
+        }
+        else if (type == ERROR)
+                node->u.message = string;
+
 	return node;
+}
+
+static struct node *new_error(char *fmt, ...)
+{
+        va_list args;
+        char *msg = NULL;
+
+        va_start(args, fmt);
+        if (vasprintf(&msg, fmt, args) < 0)
+                msg = NULL;
+        va_end(args);
+
+        return new_node(ERROR, 0, 0, msg, NULL, NULL);
 }
 
 static struct node *new_nil(void)
 {
-	return new_node(NIL);
+	return new_node(NIL, 0, 0, NULL, NULL, NULL);
 }
 
 static struct node *new_true(void)
 {
-	return new_node(TRUE);
+	return new_node(TRUE, 0, 0, NULL, NULL, NULL);
 }
 
 static struct node *new_false(void)
 {
-	return new_node(FALSE);
+	return new_node(FALSE, 0, 0, NULL, NULL, NULL);
 }
 
 static struct node *new_integer(long long integer)
 {
-	struct node *node = new_node(INTEGER);
-	if (node->type == ERROR)
-		return node;
-
-	node->u.integer = integer;
-	return node;
+	return new_node(INTEGER, integer, 0, NULL, NULL, NULL);
 }
 
 static struct node *new_real(double real)
 {
-	struct node *node = new_node(REAL);
-	if (node->type == ERROR)
-		return node;
-
-	node->u.real = real;
-	return node;
+        return new_node(REAL, 0, real, NULL, NULL, NULL);
 }
 
 static struct node *new_string(char *string)
 {
-	struct node *node = new_node(STRING);
-	if (node->type == ERROR)
-		return node;
-
-	node->u.string = strndup(&string[1], strlen(string) - 2);
-	if (!node->u.string)
-	{
-		free_node(node);
-		return new_error("error allocating node string");
-	}
-	return node;
+        return new_node(STRING, 0, 0, string, NULL, NULL);
 }
 
-static struct node *new_keyword(char *string)
+static struct node *new_keyword(char *keyword)
 {
-	struct node *node = new_node(KEYWORD);
-	if (node->type == ERROR)
-		return node;
-
-	node->u.keyword = strndup(&string[1], strlen(string) - 1);
-	if (!node->u.keyword)
-	{
-		free_node(node);
-		return new_error("error allocating node keyword");
-	}
-	return node;
+        return new_node(KEYWORD, 0, 0, keyword, NULL, NULL);
 }
 
 static struct node *new_symbol(char *symbol)
 {
-	struct node *node = new_node(SYMBOL);
-	if (node->type == ERROR)
-		return node;
-
-	node->u.symbol = strdup(symbol);
-	if (!node->u.symbol)
-	{
-		free_node(node);
-		return new_error("error allocating node symbol");
-	}
-	return node;
+        return new_node(SYMBOL, 0, 0, strdup(symbol), NULL, NULL);
 }
 
-static struct node *new_list(struct node *down)
+static struct node *new_list(struct node *elements)
 {
-	struct node *node = new_node(LIST);
-	if (node->type == ERROR)
-		return node;
-
-	node->down = down;
-	return node;
+        return new_node(LIST, 0, 0, NULL, NULL, elements);
 }
 
-static struct node *new_vector(struct node *down)
+static struct node *new_vector(struct node *elements)
 {
-	struct node *node = new_node(VECTOR);
-	if (node->type == ERROR)
-		return node;
-
-	node->down = down;
-	return node;
+        return new_node(VECTOR, 0, 0, NULL, NULL, elements);
 }
 
-static struct node *new_quote(struct node *down)
+static struct node *new_hashmap(struct node *keys, struct node *values)
 {
-	struct node *quote = new_symbol("quote");
-	if (quote->type == ERROR)
-		return quote;
-
-	quote->next = down;
-	return new_list(quote);
+        return new_node(HASHMAP, 0, 0, NULL, keys, values);
 }
 
-static struct node *new_quasiquote(struct node *down)
-{
-	struct node *quote = new_symbol("quasiquote");
-	if (quote->type == ERROR)
-		return quote;
-
-	quote->next = down;
-	return new_list(quote);
-}
-
-static struct node *new_unquote(struct node *down)
-{
-	struct node *quote = new_symbol("unquote");
-	if (quote->type == ERROR)
-		return quote;
-
-	quote->next = down;
-	return new_list(quote);
-}
-
-static struct node *new_splicequote(struct node *down)
-{
-	struct node *quote = new_symbol("splice-unquote");
-	if (quote->type == ERROR)
-		return quote;
-
-	quote->next = down;
-	return new_list(quote);
-}
-
-static int is_integer(char *s)
+static int is_integer(char *token, long long *integer)
 {
 	char *end = NULL;
 
 	errno = 0;
-	(void) strtod(s, &end);
+	*integer = strtoll(token, &end, 0);
 	if (errno == ERANGE)
 		return 0;
 
@@ -428,12 +355,12 @@ static int is_integer(char *s)
 	return 1;
 }
 
-static int is_real(char *s)
+static int is_real(char *token, double *real)
 {
 	char *end = NULL;
 
 	errno = 0;
-	(void) strtod(s, &end);
+	*real = strtod(token, &end);
 	if (errno == ERANGE)
 		return 0;
 
@@ -443,57 +370,229 @@ static int is_real(char *s)
 	return 1;
 }
 
-static struct node *read_atom(struct token **tokens)
+static struct node *read_keyword(char ***tokens)
 {
-	struct node *node;
-	char *s = (*tokens)->s;
+        char *s, *prevs;
 
-	if (!strcmp(s, "nil"))
-		node = new_nil();
-	else if (!strcmp(s, "true"))
-		node = new_true();
-	else if (!strcmp(s, "false"))
-		node = new_false();
-	else if (is_integer(s))
-		node = new_integer(strtoll(s, NULL, 0));
-	else if (is_real(s))
-		node = new_real(strtod(s, NULL));
-	else if (*s == '"')
-		node = new_string(s);
-	else if (*s == ':')
-		node = new_keyword(s);
+        if (!*tokens)
+                return new_error("no keyword token to read");
+
+        s = strdup(**tokens);
+
+        if (!*s)
+		return free(s), new_error("expected keyword to start with ':'");
+	if (*s != ':')
+		return free(s), new_error("expected keyword to start with ':', got '%c'", *s);
+
+        memmove(&s[0], &s[1], strlen(&s[1]) + 1);
+
+        s = realloc(prevs = s, strlen(s) + 1);
+        if (!s)
+                return free(prevs), new_error("unable to shorten keyword");
+
+        return new_keyword(s);
+}
+
+static struct node *read_string(char ***tokens)
+{
+        char *p, *s, *prevs;
+
+        if (!*tokens)
+                return new_error("no string token to read");
+
+        p = s = strdup(**tokens);
+
+        if (!*p)
+		return free(s), new_error("expected string to start with '\"'");
+	if (*p != '"')
+		return free(s), new_error("expected string to start with '\"', got '%c'", *p);
+
+        memmove(&p[0], &p[1], strlen(&p[1]) + 1);
+
+        while (*p && *p != '"')
+        {
+                if (*p == '\\')
+                {
+                        char esc;
+
+                        if (strlen(p) <= 1)
+                                return free(s), new_error("unterminated escape sequence");
+
+                        esc = p[1];
+
+                        switch (esc)
+                        {
+                        case 'a': *p = '\a'; break;
+                        case 'b': *p = '\b'; break;
+                        case 'e': *p = '\x1b'; break;
+                        case 'f': *p = '\f'; break;
+                        case 'n': *p = '\n'; break;
+                        case 'r': *p = '\r'; break;
+                        case 't': *p = '\t'; break;
+                        case 'v': *p = '\v'; break;
+                        case '\\': *p = '\\'; break;
+                        case '"': *p = '"'; break;
+                        default:
+                                return free(s), new_error("invalid escape sequence, got '%c'", esc);
+                        }
+
+                        memmove(&p[1], &p[2], strlen(&p[2]) + 1);
+                }
+
+                p++;
+        }
+
+        if (!*p)
+		return free(s), new_error("unterminated string");
+	if (*p != '"')
+		return new_error("unterminated string, expected '\"' got '%c'", *p);
+
+        *p = '\0';
+
+        s = realloc(prevs = s, strlen(s) + 1);
+        if (!s)
+                return free(prevs), new_error("unable to shorten string");
+
+        return new_string(s);
+}
+
+static struct node *read_atom(char ***tokens)
+{
+        struct node *atom;
+        long long integer;
+        double real;
+
+        if (!tokens || !*tokens || !**tokens)
+                return new_error("no atom token to read");
+
+        if (***tokens == '"')
+                atom = read_string(tokens);
+        else if (***tokens == ':')
+                atom = read_keyword(tokens);
+        else if (!strcmp(**tokens, "nil"))
+                atom = new_nil();
+        else if (!strcmp(**tokens, "true"))
+                atom = new_true();
+        else if (!strcmp(**tokens, "false"))
+                atom = new_false();
+	else if (is_integer(**tokens, &integer))
+		atom = new_integer(integer);
+	else if (is_real(**tokens, &real))
+		atom = new_real(real);
 	else
-		node = new_symbol(s);
+		atom = new_symbol(**tokens);
 
-	if (node->type != ERROR)
-		*tokens = (*tokens)->next;
+        (*tokens)++;
 
-	return node;
+        return atom;
 }
 
-static struct node *read_form(struct token **tokens);
+static struct node *read_hashmap(char ***tokens, struct node *(read_form)(char ***))
+{
+	struct token *token;
+	struct node *lastkey = NULL;
+	struct node *lastval = NULL;
+	struct node *downkey = NULL;
+	struct node *downval = NULL;
+	struct node *node = NULL;
 
-static struct node *read_list(struct token **tokens)
+        if (!*tokens)
+                return new_error("no hashmap token to read");
+
+	if (strcmp(**tokens, "{"))
+		return new_error("expected '{', got '%s'", **tokens);
+
+        (*tokens)++;
+
+	while (**tokens && strcmp(**tokens, "}"))
+	{
+                struct node *key, *val;
+
+		key = read_form(tokens);
+                if (key->type == ERROR)
+                {
+                        freenode(downkey);
+                        freenode(downval);
+			return key;
+                }
+                else if (key->type != STRING && key->type != KEYWORD)
+                {
+                        int type = key->type;
+                        freenode(downkey);
+                        freenode(downval);
+                        freenode(key);
+                        return new_error("hashmap key must be string or keyword, got %s", typestring(type));
+                }
+
+                if (!**tokens)
+                {
+                        freenode(downkey);
+                        freenode(downval);
+                        return new_error("last key in hashmap lacks value");
+                }
+
+		val = read_form(tokens);
+		if (val->type == ERROR)
+		{
+                        freenode(downkey);
+                        freenode(downval);
+			freenode(key);
+			return val;
+		}
+
+		if (lastkey)
+			lastkey->next = key;
+		else
+			downkey = key;
+		lastkey = key;
+		if (lastval)
+			lastval->next = val;
+		else
+			downval = val;
+		lastval = val;
+
+	}
+
+	if (!**tokens)
+	{
+                freenode(downkey);
+                freenode(downval);
+		return new_error("unterminated hashmap");
+	}
+
+	if (strcmp(**tokens, "}"))
+	{
+                freenode(downkey);
+                freenode(downval);
+		return new_error("expected '}', got '%s'", **tokens);
+	}
+
+        (*tokens)++;
+
+	return new_hashmap(downkey, downval);
+}
+
+static struct node *read_vector(char ***tokens, struct node *(read_form)(char ***))
 {
 	struct token *token;
 	struct node *last = NULL;
 	struct node *down = NULL;
 	struct node *node = NULL;
 
-	if (!*tokens)
-		return NULL;
-	if (strcmp((*tokens)->s, "("))
-		return new_error("unexpected list initiator");
-	*tokens = (*tokens)->next;
+        if (!*tokens)
+                return new_error("no vector token to read");
 
-	token = *tokens;
-	while (token && strcmp(token->s, ")"))
+	if (strcmp(**tokens, "["))
+		return new_error("expected '[', got '%s'", **tokens);
+
+        (*tokens)++;
+
+	while (**tokens && strcmp(**tokens, "]"))
 	{
-		struct node *next = read_form(&token);
-
+		struct node *next = read_form(tokens);
 		if (next->type == ERROR)
 		{
-			free_node(down);
+			freenode(down);
 			return next;
 		}
 
@@ -504,468 +603,367 @@ static struct node *read_list(struct token **tokens)
 		last = next;
 	}
 
-	if (!token)
+	if (!**tokens)
 	{
-		free_node(down);
-		return new_error("unterminated list");
-	}
-
-	if (strcmp(token->s, ")"))
-	{
-		free_node(down);
-		return new_error("unexpected list terminator");
-	}
-
-	*tokens = token->next;
-
-	return new_list(down);
-}
-
-static struct node *read_vector(struct token **tokens)
-{
-	struct token *token;
-	struct node *last = NULL;
-	struct node *down = NULL;
-	struct node *node = NULL;
-
-	if (!*tokens)
-		return NULL;
-	if (strcmp((*tokens)->s, "["))
-		return new_error("unexpected vector initiator");
-
-	*tokens = (*tokens)->next;
-
-	token = *tokens;
-	while (token && strcmp(token->s, "]"))
-	{
-		struct node *next = read_form(&token);
-
-		if (next->type == ERROR)
-		{
-			free_node(down);
-			return next;
-		}
-
-		if (last)
-			last->next = next;
-		else
-			down = next;
-		last = next;
-	}
-
-	if (!token)
-	{
-		free_node(down);
+		freenode(down);
 		return new_error("unterminated vector");
 	}
 
-	if (strcmp(token->s, "]"))
+	if (strcmp(**tokens, "]"))
 	{
-		free_node(down);
-		return new_error("unexpected vector terminator");
+		freenode(down);
+		return new_error("expected ']', got '%s'", **tokens);
 	}
 
-	*tokens = token->next;
+        (*tokens)++;
 
 	return new_vector(down);
 }
 
-static struct node *read_quote(struct token **tokens)
+static struct node *read_list(char ***tokens, struct node *(read_form)(char ***))
 {
-	struct node *quoted;
-
-	if (!*tokens)
-		return NULL;
-	if (strcmp((*tokens)->s, "'"))
-		return new_error("unexpected quote initiator");
-
-	*tokens = (*tokens)->next;
-
-	quoted = read_form(tokens);
-	if (quoted->type == ERROR)
-		return quoted;
-
-	return new_quote(quoted);
-}
-
-static struct node *read_quasiquote(struct token **tokens)
-{
-	struct node *quoted;
-
-	if (!*tokens)
-		return NULL;
-	if (strcmp((*tokens)->s, "`"))
-		return new_error("unexpected quasiquote initiator");
-
-	*tokens = (*tokens)->next;
-
-	quoted = read_form(tokens);
-	if (quoted->type == ERROR)
-		return quoted;
-
-	return new_quasiquote(quoted);
-}
-
-static struct node *read_unquote(struct token **tokens)
-{
-	struct node *quoted;
-
-	if (!*tokens)
-		return NULL;
-	if (strcmp((*tokens)->s, "~"))
-		return new_error("unexpected unquote initiator");
-
-	*tokens = (*tokens)->next;
-
-	quoted = read_form(tokens);
-	if (quoted->type == ERROR)
-		return quoted;
-
-	return new_unquote(quoted);
-}
-
-static struct node *read_spliceunquote(struct token **tokens)
-{
-	struct node *quoted;
-
-	if (!*tokens)
-		return NULL;
-	if (strcmp((*tokens)->s, "~@"))
-		return new_error("unexpected splice-unquote initiator");
-
-	*tokens = (*tokens)->next;
-
-	quoted = read_form(tokens);
-	if (quoted->type == ERROR)
-		return quoted;
-
-	return new_splicequote(quoted);
-}
-
-static struct node *read_form(struct token **tokens)
-{
-	struct node *ast = NULL;
+	struct token *token;
+	struct node *last = NULL;
+	struct node *down = NULL;
 	struct node *node = NULL;
 
-	if (*tokens == NULL)
-		return NULL;
+        if (!*tokens)
+                return new_error("no list token to read");
 
-	if (!strcmp((*tokens)->s, "("))
-		node = read_list(tokens);
-	else if (!strcmp((*tokens)->s, "["))
-		node = read_vector(tokens);
-	else if (!strcmp((*tokens)->s, "'"))
-		node = read_quote(tokens);
-	else if (!strcmp((*tokens)->s, "`"))
-		node = read_quasiquote(tokens);
-	else if (!strcmp((*tokens)->s, "~"))
-		node = read_unquote(tokens);
-	else if (!strcmp((*tokens)->s, "~@"))
-		node = read_spliceunquote(tokens);
-	else
-		node = read_atom(tokens);
+	if (strcmp(**tokens, "("))
+		return new_error("expected '(', got '%s'", **tokens);
 
-	return node;
-}
+        (*tokens)++;
 
-static struct node *read_str(char *code)
-{
-	struct token *tokens, *orig;
-	struct node *node;
-
-	orig = tokens = tokenize(code);
-	node = read_form(&tokens);
-	free_tokens(orig);
-
-	if (tokens != NULL && node && node->type != ERROR)
+	while (**tokens && strcmp(**tokens, ")"))
 	{
-		free_node(node);
-		return new_error("not all tokens interpreted");
-	}
-
-
-	return node;
-}
-
-static char *pr_form(struct node *node, int readable);
-
-static char *pr_list(struct node *node, int readable)
-{
-	char *prevresult, *result = NULL;
-	char *part;
-	char *p;
-
-	result = strdup("()");
-	if (!result)
-		return strdup("Error: cannot format empty list");
-
-	while (node)
-	{
-		int new = 0;
-		int len = 0;
-		int used = strlen(result);
-
-		if (node->type == ERROR)
+		struct node *next = read_form(tokens);
+		if (next->type == ERROR)
 		{
-			free(result);
-			return pr_form(node, readable);
+			freenode(down);
+			return next;
 		}
 
-		part = pr_form(node, readable);
-		if (!part)
-		{
-			free(result);
-			return strdup("Error: cannot format list element");
-		}
-
-		new = snprintf(NULL, 0, "%s%s", part, node->next ? " " : "");
-		if (new < 0)
-		{
-			free(result);
-			free(part);
-			return strdup("Error: cannot determine list element length");
-		}
-
-		len = used + new + 1;
-		result = realloc(prevresult = result, len);
-		if (!result)
-		{
-			free(prevresult);
-			free(part);
-			return strdup("Error: cannot extend list");
-		}
-
-		new = snprintf(result + used - 1, len - used + 1, "%s%s)", part, node->next ? " " : "");
-		if (new < 0)
-		{
-			free(result);
-			free(part);
-			return strdup("Error: cannot append element to list");
-		}
-
-		free(part);
-		node = node->next;
-	}
-
-	return result;
-}
-
-static char *pr_vector(struct node *node, int readable)
-{
-	char *prevresult, *result = NULL;
-	char *part;
-	char *p;
-
-	result = strdup("[]");
-	if (!result)
-		return strdup("Error: cannot format empty list");
-
-	while (node)
-	{
-		int new = 0;
-		int len = 0;
-		int used = strlen(result);
-
-		if (node->type == ERROR)
-		{
-			free(result);
-			return pr_form(node, readable);
-		}
-
-		part = pr_form(node, readable);
-		if (!part)
-		{
-			free(result);
-			return strdup("Error: cannot format list element");
-		}
-
-		new = snprintf(NULL, 0, "%s%s", part, node->next ? " " : "");
-		if (new < 0)
-		{
-			free(result);
-			free(part);
-			return strdup("Error: cannot determine list element length");
-		}
-
-		len = used + new + 1;
-		result = realloc(prevresult = result, len);
-		if (!result)
-		{
-			free(prevresult);
-			free(part);
-			return strdup("Error: cannot extend list");
-		}
-
-		new = snprintf(result + used - 1, len - used + 1, "%s%s]", part, node->next ? " " : "");
-		if (new < 0)
-		{
-			free(result);
-			free(part);
-			return strdup("Error: cannot append element to list");
-		}
-
-		free(part);
-		node = node->next;
-	}
-
-	return result;
-}
-
-static char *pr_str(struct node *node, int readable)
-{
-	char *prevresult, *result;
-	char c[3] = { '\0', '\0', '\0' };
-	char *p;
-	int len;
-
-	if (!node)
-		return NULL;
-
-	p = node->u.string;
-
-	len = 1 + strlen(p) + 1 + 1;
-	result = malloc(len);
-	if (!result)
-		return strdup("Error: cannot allocate string");
-	result[0] = '\0';
-	strcat(result, "\"");
-
-	while (*p)
-	{
-		c[0] = c[1] = '\0';
-
-		if (readable)
-		{
-			switch (*p)
-			{
-			case '\a': c[0] = '\\'; c[1] = 'a'; break;
-			case '\b': c[0] = '\\'; c[1] = 'b'; break;
-			case '\x1b': c[0] = '\\'; c[1] = 'e'; break;
-			case '\f': c[0] = '\\'; c[1] = 'f'; break;
-			case '\n': c[0] = '\\'; c[1] = 'n'; break;
-			case '\r': c[0] = '\\'; c[1] = 'r'; break;
-			case '\t': c[0] = '\\'; c[1] = 't'; break;
-			case '\v': c[0] = '\\'; c[1] = 'v'; break;
-			case '\\': c[0] = '\\'; c[1] = '\\'; break;
-			case '"': c[0] = '\\'; c[1] = '"'; break;
-			default: c[0] = *p; break;
-			}
-
-			if (c[0] == '\\')
-			{
-				len++;
-				result = realloc(prevresult = result, len);
-				if (!result)
-				{
-					free(prevresult);
-					return strdup("Error: cannot format string");
-				}
-			}
-		}
+		if (last)
+			last->next = next;
 		else
-			c[0] = *p;
-
-		strcat(result, c);
-		p++;
+			down = next;
+		last = next;
 	}
 
-	strcat(result, "\"");
-
-	return result;
-}
-
-static char *pr_form(struct node *node, int readable)
-{
-	char *result;
-
-	if (!node)
-		return NULL;
-
-	switch (node->type)
+	if (!**tokens)
 	{
-	case ERROR:
-		if (asprintf(&result, "Error: %s", node->u.error) < 0)
-			result = strdup("Error: cannot format error message");
-		break;
-	case FALSE: result = strdup("false"); break;
-	case TRUE: result = strdup("true"); break;
-	case NIL: result = strdup("nil"); break;
-	case INTEGER:
-		if (asprintf(&result, "%lld", node->u.integer) < 0)
-			result = strdup("Error: cannot format integer");
-		break;
-	case REAL:
-		if (asprintf(&result, "%f", node->u.integer) < 0)
-			result = strdup("Error: cannot format real");
-		break;
-	case SYMBOL:
-		result = strdup(node->u.symbol);
-		break;
-	case STRING:
-		result = pr_str(node, readable);
-		break;
-	case LIST:
-		result = pr_list(node->down, readable);
-		break;
-	case VECTOR:
-		result = pr_vector(node->down, readable);
-		break;
-	case KEYWORD:
-		if (asprintf(&result, ":%s", node->u.keyword) < 0)
-			result = strdup("Error: cannot format keyword");
-		break;
+		freenode(down);
+		return new_error("unterminated list");
 	}
 
-	return result;
+	if (strcmp(**tokens, ")"))
+	{
+		freenode(down);
+		return new_error("expected ')', got '%s'", **tokens);
+	}
+
+        (*tokens)++;
+
+	return new_list(down);
 }
 
-
-static struct node *READ(char *code)
+static struct node *prepend_node(struct node *car, struct node *cdr)
 {
-	struct node *ast = read_str(code);
-	free(code);
+        car->next = cdr;
+        return car;
+}
+
+static struct node *read_quote(char ***tokens, char *quote, struct node *(read_form)(char ***))
+{
+	struct node *quoted, *symbol;
+
+        if (!*tokens)
+                return new_error("no quoted token to read");
+
+        (*tokens)++;
+
+        quoted = read_form(tokens);
+        if (quoted->type == ERROR)
+                return quoted;
+
+        symbol = new_symbol(quote);
+        if (symbol->type == ERROR)
+        {
+                freenode(quoted);
+                return symbol;
+        }
+
+        return new_list(prepend_node(symbol, quoted));
+}
+
+static struct node *read_metadata(char ***tokens, struct node *(read_form)(char ***))
+{
+	struct node *func, *meta, *symbol;
+
+        if (!*tokens)
+                return new_error("no meta token to read");
+
+        (*tokens)++;
+
+        func = read_form(tokens);
+        if (func->type == ERROR)
+                return func;
+
+        meta = read_form(tokens);
+        if (meta->type == ERROR)
+        {
+                freenode(func);
+                return meta;
+        }
+
+        symbol = new_symbol("with-meta");
+        if (symbol->type == ERROR)
+        {
+                freenode(func);
+                freenode(meta);
+                return symbol;
+        }
+
+        return new_list(prepend_node(symbol, prepend_node(meta, func)));
+}
+
+static struct node *read_form(char ***tokens)
+{
+	struct node *ast;
+
+        if (!tokens || !*tokens)
+                return NULL;
+
+	else if (!strcmp(**tokens, "("))
+		ast = read_list(tokens, read_form);
+	else if (!strcmp(**tokens, "["))
+		ast = read_vector(tokens, read_form);
+	else if (!strcmp(**tokens, "{"))
+		ast = read_hashmap(tokens, read_form);
+        else if (!strcmp(**tokens, "~@"))
+                ast = read_quote(tokens, "splice-unquote", read_form);
+        else if (!strcmp(**tokens, "'"))
+                ast = read_quote(tokens, "quote", read_form);
+        else if (!strcmp(**tokens, "`"))
+                ast = read_quote(tokens, "quasiquote", read_form);
+        else if (!strcmp(**tokens, "~"))
+                ast = read_quote(tokens, "unquote", read_form);
+        else if (!strcmp(**tokens, "@"))
+                ast = read_quote(tokens, "deref", read_form);
+        else if (!strcmp(**tokens, "^"))
+                ast = read_metadata(tokens, read_form);
+	else
+		ast = read_atom(tokens);
+
 	return ast;
 }
 
-static struct node *EVAL(struct node *ast)
+static void freetokens(char **tokens)
 {
+        char **token = tokens;
+
+        if (tokens == errortokens)
+                return;
+
+        while (token && *token)
+        {
+                free(*token);
+                token++;
+        }
+
+        free(tokens);
+}
+
+#define lexerror(tokens, msg)  lexerror_imp((tokens), "\"" msg "\"")
+
+static char **lexerror_imp(char **tokens, char *msg)
+{
+        freetokens(tokens);
+
+        errortokens[2] = msg;
+        return &errortokens[0];
+}
+
+static inline bool ateol(char *line)
+{
+        return *line == '\0';
+}
+
+static char *lex_whitecomma(char *line)
+{
+        const char *whitecomma = "\t\n\v\f\r ,";
+        while (!ateol(line) && strchr(whitecomma, *line))
+                line++;
+        return line;
+}
+
+static char *lex_comment(char *line, char **begin, char **end)
+{
+        if (*line != ';')
+                return line;
+
+        *begin = line;
+        *end = line + strlen(line);
+        return *end;
+}
+
+static char *lex_spliceunquote(char *line, char **begin, char **end)
+{
+        if (strncmp(line, "~@", 2))
+                return line;
+
+        *begin = line;
+        *end = line + 2;
+        return *end;
+}
+
+static char *lex_special(char *line, char **begin, char **end)
+{
+        const char *special = "[]{}()'`~^@";
+
+        if (*line == '\0')
+                return line;
+        if (!strchr(special, *line))
+                return line;
+
+        *begin = line;
+        *end = line + 1;
+        return *end;
+}
+
+static char *lex_string(char *line, char **begin, char **end)
+{
+        char *s = line;
+
+        if (*s != '"')
+                return line;
+        s++;
+
+        while (*s && *s != '"')
+        {
+                if (!strncmp(s, "\\\"", 2))
+                        s += 2;
+                else
+                        s++;
+        }
+
+        if (*s == '"')
+                s++;
+
+        *begin = line;
+        *end = s;
+        return *end;
+}
+
+static char *lex_symbol(char *line, char **begin, char **end)
+{
+        const char *notallowed = "\t\n\v\f\r []{}()'\"`,;";
+        char *s = line;
+
+        while (*s && !strchr(notallowed, *s))
+                s++;
+
+        if (s == line)
+                return line;
+
+        *begin = line;
+        *end = s;
+        return *end;
+}
+
+static char *lex_token(char **tokens, int count, char *line, char **begin, char **end)
+{
+        char *prevline = line;
+
+        *begin = *end = NULL;
+
+        if (prevline == line)
+                line = lex_comment(line, begin, end);
+        if (prevline == line)
+                line = lex_spliceunquote(line, begin, end);
+        if (prevline == line)
+                line = lex_special(line, begin, end);
+        if (prevline == line)
+                line = lex_string(line, begin, end);
+        if (prevline == line)
+                line = lex_symbol(line, begin, end);
+
+        if (prevline == line)
+                return NULL;
+
+        return line;
+}
+
+static char **tokenize(char *line)
+{
+        char **tokens;
+        int count;
+
+        count = 1;
+        tokens = calloc(count, sizeof(char *));
+        if (!tokens)
+                return lexerror(tokens, "cannot allocate empty list of tokens");
+
+        while (tokens && !ateol(line))
+        {
+                char *begin, *end;
+                char **prevtokens;
+
+                line = lex_whitecomma(line);
+                if (ateol(line))
+                        continue;
+
+                line = lex_token(tokens, count, line, &begin, &end);
+                if (!line)
+                        return lexerror(tokens, "cannot lex token");
+
+                tokens = realloc(prevtokens = tokens, ++count * sizeof(char *));
+                if (!tokens)
+                        return lexerror(prevtokens, "cannot extend list of tokens");
+
+                tokens[count - 1] = NULL;
+                tokens[count - 2] = strndup(begin, end - begin);
+                if (!tokens[count - 2])
+                        return lexerror(tokens, "cannot append token to list of tokens");
+        }
+
+	return tokens;
+}
+
+static struct node *parse(char *line)
+{
+        char **tokens, **alltokens;
+	struct node *ast;
+
+        if (!line)
+                return NULL;
+
+        alltokens = tokens = tokenize(line);
+        free(line);
+
+        ast = read_form(&tokens);
+        freetokens(alltokens);
+
 	return ast;
 }
 
-static char *PRINT(struct node *ast)
+static char *reed(char *prompt)
 {
-	char *result = pr_form(ast, 1);
-	free_node(ast);
-	return result;
+        char *line = readline(prompt);
+        if (line && *line)
+                add_history(line);
+        return line;
 }
 
-static char *rep(char *code)
+static void repl(void)
 {
-	return PRINT(EVAL(READ(code)));
+        while (print(eval(parse(reed(PROMPT))), true));
 }
 
 int main(int argc, char **argv)
 {
-	char *line, *result;
+        repl();
 
-	do
-	{
-		line = readline("user> ");
-		if (line)
-			add_history(line);
-
-		if (line)
-		{
-			result = rep(line);
-			if (result && strlen(result))
-				printf("%s\n", result);
-		}
-		else
-			result = NULL;
-
-		free(result);
-
-	} while (line != NULL);
-
-	printf("\n");
+        return 0;
 }
